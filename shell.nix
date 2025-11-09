@@ -33,5 +33,6 @@ pkgs.mkShell {
     echo "Python environment is ready and activated."
     export SHELL=/usr/bin/bash
     echo "SHELL variable set to $SHELL for host compatibility."
+    pre-commit install && pre-commit autoupdate
   '';
 }
