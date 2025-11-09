@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OKX Loan Monitor using requests library (more reliable)
-Install: pip install requests
+OKX Flexible Multicollateral Loan Monitor
+Clean version with requests library
 """
 
 import os
@@ -9,24 +9,17 @@ import json
 import hmac
 import base64
 import hashlib
+import requests
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-try:
-    import requests
-except ImportError:
-    print("❌ Error: 'requests' library not installed")
-    print("Install it with: pip install requests")
-    exit(1)
-
 
 class OKXLoanMonitor:
-    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0", debug: bool = False):
+    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0"):
         self.api_key = api_key.strip()
         self.secret_key = secret_key.strip()
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
-        self.debug = debug
 
     def _get_timestamp(self) -> str:
         """Get ISO8601 timestamp"""
@@ -67,15 +60,6 @@ class OKXLoanMonitor:
 
         url = self.base_url + request_path
 
-        if self.debug:
-            print(f"\n🔍 REQUEST:")
-            print(f"  URL: {url}")
-            print(f"  Method: {method}")
-            print(f"  Timestamp: {timestamp}")
-            print(
-                f"  String to sign: {timestamp + method + request_path + body}")
-            print(f"  Signature: {sign[:20]}...")
-
         try:
             if method == 'GET':
                 response = requests.get(url, headers=headers, timeout=10)
@@ -83,25 +67,78 @@ class OKXLoanMonitor:
                 response = requests.post(
                     url, headers=headers, data=body, timeout=10)
 
-            if self.debug:
-                print(f"  Status Code: {response.status_code}")
-
             return response.json()
 
         except requests.exceptions.RequestException as e:
             return {"code": "error", "msg": str(e)}
 
     def get_account_balance(self) -> Dict:
+        """Get trading account balance"""
         return self._request('GET', '/api/v5/account/balance')
 
     def get_flexible_loan_info(self) -> Dict:
+        """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def calculate_metrics(self, balance_data: Dict) -> Dict:
-        metrics = {
-            'total_equity': 0.0,
-            'total_debt': 0.0,
+    def parse_loan_info(self, loan_data: Dict) -> Dict:
+        """Parse flexible loan information"""
+        loan_metrics = {
+            'has_loan': False,
+            'collateral_usd': 0.0,
+            'loan_usd': 0.0,
             'current_ltv': 0.0,
+            'margin_call_ltv': 0.0,
+            'liquidation_ltv': 0.0,
+            'collateral_assets': [],
+            'loan_assets': []
+        }
+
+        if loan_data.get('code') != '0':
+            return loan_metrics
+
+        data = loan_data.get('data', [])
+        if not data:
+            return loan_metrics
+
+        loan_info = data[0]
+        loan_metrics['has_loan'] = True
+
+        # Parse collateral
+        collateral_data = loan_info.get('collateralData', [])
+        for item in collateral_data:
+            amt = float(item.get('amt', 0))
+            if amt > 0:
+                loan_metrics['collateral_assets'].append({
+                    'currency': item.get('ccy', ''),
+                    'amount': amt
+                })
+
+        # Parse loans
+        loan_data_list = loan_info.get('loanData', [])
+        for item in loan_data_list:
+            amt = float(item.get('amt', 0))
+            if amt > 0:
+                loan_metrics['loan_assets'].append({
+                    'currency': item.get('ccy', ''),
+                    'amount': amt
+                })
+
+        # Parse metrics
+        loan_metrics['collateral_usd'] = float(
+            loan_info.get('collateralNotionalUsd', 0))
+        loan_metrics['loan_usd'] = float(loan_info.get('loanNotionalUsd', 0))
+        loan_metrics['current_ltv'] = float(loan_info.get('curLTV', 0)) * 100
+        loan_metrics['margin_call_ltv'] = float(
+            loan_info.get('marginCallLTV', 0)) * 100
+        loan_metrics['liquidation_ltv'] = float(
+            loan_info.get('liqLTV', 0)) * 100
+
+        return loan_metrics
+
+    def calculate_account_metrics(self, balance_data: Dict) -> Dict:
+        """Calculate metrics from trading account balance"""
+        metrics = {
+            'total_equity_usd': 0.0,
             'currencies': []
         }
 
@@ -112,115 +149,161 @@ class OKXLoanMonitor:
         if not data:
             return metrics
 
+        total_eq_val = data[0].get('totalEq', '0')
+        metrics['total_equity_usd'] = float(
+            total_eq_val) if total_eq_val and total_eq_val != '' else 0.0
+
         details = data[0].get('details', [])
 
         for detail in details:
             ccy = detail.get('ccy', '')
 
-            # Safely convert to float, handling empty strings
             eq_val = detail.get('eq', '0')
             eq = float(eq_val) if eq_val and eq_val != '' else 0.0
-
-            liab_val = detail.get('liab', '0')
-            liab = float(liab_val) if liab_val and liab_val != '' else 0.0
 
             avail_val = detail.get('availEq', '0')
             avail = float(avail_val) if avail_val and avail_val != '' else 0.0
 
-            if eq > 0 or liab > 0:
+            if eq > 0:
                 metrics['currencies'].append({
                     'currency': ccy,
                     'equity': eq,
-                    'debt': liab,
                     'available': avail
                 })
 
-            metrics['total_debt'] += liab
-
-        total_eq_usd = float(data[0].get('totalEq', '0') or 0)
-        adj_eq = float(data[0].get('adjEq', '0') or 0)
-
-        if metrics['total_debt'] > 0 and adj_eq > 0:
-            metrics['current_ltv'] = (metrics['total_debt'] / adj_eq) * 100
-
-        metrics['total_equity_usd'] = total_eq_usd
-        metrics['adjusted_equity'] = adj_eq
-        metrics['margin_ratio'] = data[0].get('mgnRatio', '')
-
         return metrics
 
-    def display_metrics(self, metrics: Dict):
-        print("\n" + "="*60)
+    def display_combined_metrics(self, account_metrics: Dict, loan_metrics: Dict):
+        """Display comprehensive loan and account information"""
+        print("\n" + "="*70)
         print("OKX FLEXIBLE MULTICOLLATERAL LOAN OVERVIEW")
-        print("="*60)
+        print("="*70)
         print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("-"*60)
+        print("-"*70)
 
-        print(f"\n📊 OVERALL METRICS")
-        print(
-            f"  Total Equity (USD):        ${metrics.get('total_equity_usd', 0):,.2f}")
-        print(
-            f"  Adjusted Equity (USD):     ${metrics.get('adjusted_equity', 0):,.2f}")
-        print(
-            f"  Total Debt (USD):          ${metrics.get('total_debt', 0):,.2f}")
-
-        if metrics.get('margin_ratio'):
-            print(f"  Margin Ratio:              {metrics['margin_ratio']}")
-
-        if metrics.get('current_ltv', 0) > 0:
-            ltv = metrics['current_ltv']
-            print(f"  Current LTV:               {ltv:.2f}%")
-
-            if ltv < 50:
-                risk = "✅ LOW"
-            elif ltv < 70:
-                risk = "⚠️  MEDIUM"
-            else:
-                risk = "🚨 HIGH"
-            print(f"  Risk Level:                {risk}")
-        else:
-            print(f"  Current LTV:               0.00% (No debt)")
-
-        print(f"\n💰 CURRENCY BREAKDOWN")
-        currencies = metrics.get('currencies', [])
-        if currencies:
+        if not loan_metrics.get('has_loan'):
+            print("\n⚠️  No active flexible loan found")
             print(
-                f"  {'Currency':<10} {'Equity':<15} {'Debt':<15} {'Available':<15}")
-            print(f"  {'-'*10} {'-'*15} {'-'*15} {'-'*15}")
-            for curr in currencies:
-                print(
-                    f"  {curr['currency']:<10} {curr['equity']:<15.8f} {curr['debt']:<15.8f} {curr['available']:<15.8f}")
-        else:
-            print("  No active currencies")
+                f"\n💰 Trading Account Balance: ${account_metrics.get('total_equity_usd', 0):,.2f}")
+            return
 
-        print("\n" + "="*60 + "\n")
+        # Main loan metrics
+        print(f"\n📊 LOAN SUMMARY")
+        print(
+            f"  Collateral Value (USD):    ${loan_metrics['collateral_usd']:,.2f}")
+        print(f"  Loan Amount (USD):         ${loan_metrics['loan_usd']:,.2f}")
+        print(
+            f"  Current LTV:               {loan_metrics['current_ltv']:.2f}%")
+        print(
+            f"  Margin Call LTV:           {loan_metrics['margin_call_ltv']:.2f}%")
+        print(
+            f"  Liquidation LTV:           {loan_metrics['liquidation_ltv']:.2f}%")
+
+        # Risk assessment
+        current_ltv = loan_metrics['current_ltv']
+        margin_call_ltv = loan_metrics['margin_call_ltv']
+        liq_ltv = loan_metrics['liquidation_ltv']
+
+        ltv_to_margin_call = margin_call_ltv - current_ltv
+        ltv_to_liquidation = liq_ltv - current_ltv
+        margin_call_pct = (current_ltv / margin_call_ltv) * 100
+
+        print(f"\n⚠️  RISK STATUS")
+
+        if margin_call_pct < 70:
+            risk = "✅ SAFE"
+        elif margin_call_pct < 85:
+            risk = "⚠️  CAUTION"
+        elif margin_call_pct < 95:
+            risk = "🟠 WARNING"
+        elif current_ltv < margin_call_ltv:
+            risk = "🔴 HIGH RISK"
+        else:
+            risk = "🚨 MARGIN CALL ACTIVE"
+
+        print(f"  Risk Level:                {risk}")
+        print(f"  LTV vs Margin Call:        {margin_call_pct:.1f}%")
+        print(f"  Buffer to Margin Call:     {ltv_to_margin_call:.2f}% LTV")
+        print(f"  Buffer to Liquidation:     {ltv_to_liquidation:.2f}% LTV")
+
+        if ltv_to_margin_call > 0:
+            collateral_drop_pct = (ltv_to_margin_call / margin_call_ltv) * 100
+            print(
+                f"  Collateral can drop:       {collateral_drop_pct:.1f}% before margin call")
+
+        # Loan breakdown
+        print(f"\n💸 BORROWED")
+        if loan_metrics['loan_assets']:
+            for asset in loan_metrics['loan_assets']:
+                print(f"  {asset['currency']:<10} {asset['amount']:>20,.8f}")
+            print(f"  {'TOTAL (USD)':<10} ${loan_metrics['loan_usd']:>19,.2f}")
+
+        # Collateral breakdown
+        print(
+            f"\n🔒 COLLATERAL ({len(loan_metrics['collateral_assets'])} assets)")
+        if loan_metrics['collateral_assets']:
+            sorted_collateral = sorted(
+                loan_metrics['collateral_assets'],
+                key=lambda x: x['amount'],
+                reverse=True
+            )
+
+            print(f"  {'Currency':<10} {'Amount':<20}")
+            print(f"  {'-'*10} {'-'*20}")
+
+            for asset in sorted_collateral[:15]:
+                if asset['amount'] > 0.00001:
+                    print(
+                        f"  {asset['currency']:<10} {asset['amount']:>20,.8f}")
+
+            if len(sorted_collateral) > 15:
+                remaining = len(sorted_collateral) - 15
+                print(f"  ... and {remaining} more (dust amounts)")
+
+            print(f"  {'-'*32}")
+            print(
+                f"  {'TOTAL (USD)':<10} ${loan_metrics['collateral_usd']:>19,.2f}")
+
+        # Trading account
+        print(f"\n💰 TRADING ACCOUNT (Available for Operations)")
+        print(
+            f"  Total Balance:             ${account_metrics.get('total_equity_usd', 0):,.2f}")
+
+        if account_metrics.get('currencies'):
+            significant_assets = [
+                c for c in account_metrics['currencies']
+                if c['equity'] > 0.0001
+            ]
+
+            if significant_assets:
+                print(f"\n  Top Assets:")
+                print(f"  {'Currency':<10} {'Balance':<15} {'Available':<15}")
+                print(f"  {'-'*10} {'-'*15} {'-'*15}")
+
+                for curr in significant_assets[:10]:
+                    print(
+                        f"  {curr['currency']:<10} {curr['equity']:>15,.8f} {curr['available']:>15,.8f}")
+
+                if len(significant_assets) > 10:
+                    print(
+                        f"  ... and {len(significant_assets) - 10} more currencies")
+
+        print("\n" + "="*70 + "\n")
 
     def run(self):
-        print("Fetching loan data from OKX...")
+        """Main execution method"""
+        print("Fetching data from OKX...")
 
         balance = self.get_account_balance()
-
         loan_info = self.get_flexible_loan_info()
 
-        if self.debug:
-            print("\n🔍 RAW ACCOUNT BALANCE INFO:")
-            print(json.dumps(balance, indent=2))
-            print("\n RAW FLEXIBLE LOAN INFO:")
-            print(json.dumps(loan_info, indent=2))
+        account_metrics = self.calculate_account_metrics(balance)
+        loan_metrics = self.parse_loan_info(loan_info)
 
-        if balance.get('code') == '0':
-            metrics = self.calculate_metrics(balance)
-            self.display_metrics(metrics)
-        else:
-            print(f"❌ Error: {balance.get('msg', 'Unknown error')}")
-            print(f"Code: {balance.get('code', 'N/A')}")
+        self.display_combined_metrics(account_metrics, loan_metrics)
 
 
 def main():
-    import sys
-
-    debug = '--debug' in sys.argv or '-d' in sys.argv
-
     api_key = os.getenv('OKX_API_KEY')
     secret_key = os.getenv('OKX_SECRET_KEY')
     passphrase = os.getenv('OKX_PASSPHRASE')
@@ -234,7 +317,7 @@ def main():
         print("  export OKX_PASSPHRASE='...'")
         return
 
-    monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag, debug)
+    monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag)
     monitor.run()
 
 
