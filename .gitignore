@@ -26,6 +26,12 @@ desktop.ini # Windows
 *.suo # Visual Studio
 *.user # Visual Studio
 
+# Ignore Kate editor swap files
+.*.swp
+**/*.swp
+*.kate-swp # Kate
+.*.kate-swp
+
 # Node.js specific
 node_modules/
 npm-debug.log*
