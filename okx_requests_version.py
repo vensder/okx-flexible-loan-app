@@ -80,7 +80,38 @@ class OKXLoanMonitor:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def parse_loan_info(self, loan_data: Dict) -> Dict:
+    def get_ticker_prices(self, currencies: list) -> Dict[str, float]:
+        """Get current prices for a list of currencies"""
+        prices = {}
+
+        # OKX tickers endpoint - we need to query each pair
+        # Most common quote currencies: USDT, USDC, USD
+        for ccy in currencies:
+            if ccy in ['USDT', 'USDC', 'USD']:
+                prices[ccy] = 1.0
+                continue
+
+            # Try multiple quote currencies
+            for quote in ['USDT', 'USDC', 'USD']:
+                inst_id = f"{ccy}-{quote}"
+                try:
+                    result = self._request(
+                        'GET', '/api/v5/market/ticker', {'instId': inst_id})
+                    if result.get('code') == '0' and result.get('data'):
+                        last_price = float(result['data'][0].get('last', 0))
+                        if last_price > 0:
+                            prices[ccy] = last_price
+                            break
+                except:
+                    continue
+
+            # If still not found, mark as 0
+            if ccy not in prices:
+                prices[ccy] = 0.0
+
+        return prices
+
+    def parse_loan_info(self, loan_data: Dict, prices: Dict[str, float] = None) -> Dict:
         """Parse flexible loan information"""
         loan_metrics = {
             'has_loan': False,
@@ -103,14 +134,21 @@ class OKXLoanMonitor:
         loan_info = data[0]
         loan_metrics['has_loan'] = True
 
-        # Parse collateral
+        # Parse collateral with USD values
         collateral_data = loan_info.get('collateralData', [])
         for item in collateral_data:
             amt = float(item.get('amt', 0))
+            ccy = item.get('ccy', '')
             if amt > 0:
+                # Calculate USD value if prices provided
+                usd_value = 0.0
+                if prices and ccy in prices:
+                    usd_value = amt * prices[ccy]
+
                 loan_metrics['collateral_assets'].append({
-                    'currency': item.get('ccy', ''),
-                    'amount': amt
+                    'currency': ccy,
+                    'amount': amt,
+                    'usd_value': usd_value
                 })
 
         # Parse loans
@@ -242,27 +280,40 @@ class OKXLoanMonitor:
         print(
             f"\n🔒 COLLATERAL ({len(loan_metrics['collateral_assets'])} assets)")
         if loan_metrics['collateral_assets']:
+            # Sort by USD value (descending)
             sorted_collateral = sorted(
                 loan_metrics['collateral_assets'],
-                key=lambda x: x['amount'],
+                key=lambda x: x.get('usd_value', 0),
                 reverse=True
             )
 
-            print(f"  {'Currency':<10} {'Amount':<20}")
-            print(f"  {'-'*10} {'-'*20}")
+            print(f"  {'Currency':<10} {'Amount':<20} {'USD Value':>15}")
+            print(f"  {'-'*10} {'-'*20} {'-'*15}")
 
-            for asset in sorted_collateral[:15]:
-                if asset['amount'] > 0.00001:
+            total_shown_usd = 0.0
+            shown_count = 0
+
+            for asset in sorted_collateral:
+                usd_val = asset.get('usd_value', 0)
+
+                # Show top assets or assets with significant value
+                if shown_count < 15 and usd_val > 0.01:
                     print(
-                        f"  {asset['currency']:<10} {asset['amount']:>20,.8f}")
+                        f"  {asset['currency']:<10} {asset['amount']:>20,.8f} ${usd_val:>14,.2f}")
+                    total_shown_usd += usd_val
+                    shown_count += 1
 
-            if len(sorted_collateral) > 15:
-                remaining = len(sorted_collateral) - 15
-                print(f"  ... and {remaining} more (dust amounts)")
+            # Count remaining dust
+            dust_count = len(sorted_collateral) - shown_count
+            dust_value = loan_metrics['collateral_usd'] - total_shown_usd
 
-            print(f"  {'-'*32}")
+            if dust_count > 0:
+                print(
+                    f"  ... and {dust_count} more (${dust_value:,.2f} in dust)")
+
+            print(f"  {'-'*47}")
             print(
-                f"  {'TOTAL (USD)':<10} ${loan_metrics['collateral_usd']:>19,.2f}")
+                f"  {'TOTAL (USD)':<10} {'':<20} ${loan_metrics['collateral_usd']:>14,.2f}")
 
         # Trading account
         print(f"\n💰 TRADING ACCOUNT (Available for Operations)")
@@ -297,8 +348,18 @@ class OKXLoanMonitor:
         balance = self.get_account_balance()
         loan_info = self.get_flexible_loan_info()
 
+        # Get list of currencies from loan collateral
+        print("Fetching current prices...")
+        currencies = []
+        if loan_info.get('code') == '0' and loan_info.get('data'):
+            collateral_data = loan_info['data'][0].get('collateralData', [])
+            currencies = [item['ccy'] for item in collateral_data]
+
+        # Fetch prices for all collateral currencies
+        prices = self.get_ticker_prices(currencies) if currencies else {}
+
         account_metrics = self.calculate_account_metrics(balance)
-        loan_metrics = self.parse_loan_info(loan_info)
+        loan_metrics = self.parse_loan_info(loan_info, prices)
 
         self.display_combined_metrics(account_metrics, loan_metrics)
 
