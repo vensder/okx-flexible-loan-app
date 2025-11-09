@@ -29,7 +29,7 @@ echo "  Method: $METHOD"
 echo "  Path: $REQUEST_PATH"
 echo "  Timestamp: $TIMESTAMP"
 echo "  API Key (first 8): ${API_KEY:0:8}..."
-echo "  Passphrase: $PASSPHRASE"
+echo "  Passphrase (first 3): ${PASSPHRASE:0:3}..."
 echo ""
 
 # Create signature
@@ -45,10 +45,8 @@ SIGNATURE=$(echo -n "$SIGN_STRING" | openssl dgst -sha256 -hmac "$SECRET_KEY" -b
 
 echo "✍️  Generated signature (first 20 chars):"
 echo "  ${SIGNATURE:0:20}..."
-echo "${SIGNATURE}"
 
-
-exit 0
+# exit 0
 
 # Make the request
 echo "🚀 Making API request..."
@@ -70,7 +68,7 @@ BODY_RESPONSE=$(echo "$RESPONSE" | sed '/HTTP_CODE:/d')
 echo "📥 Response:"
 echo "  HTTP Status: $HTTP_CODE"
 echo ""
-echo "$BODY_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$BODY_RESPONSE"
+echo "$BODY_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "${BODY_RESPONSE}"
 echo ""
 
 # Interpret results
