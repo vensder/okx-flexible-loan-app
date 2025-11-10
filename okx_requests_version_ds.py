@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OKX Flexible Multicollateral Loan Monitor
-Improved version with direct USD value from API
+Fixed version with better handling for low-priced tokens
 """
 
 import os
@@ -12,6 +12,7 @@ import hashlib
 import requests
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
+from decimal import Decimal, ROUND_DOWN
 
 
 class OKXLoanMonitor:
@@ -80,33 +81,123 @@ class OKXLoanMonitor:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def get_collateral_assets(self) -> Dict:
-        """Get collateral assets with USD values directly from API"""
-        return self._request('GET', '/api/v5/finance/flexible-loan/collateral-assets')
+    def get_batch_ticker_prices(self, currencies: list) -> Dict[str, float]:
+        """Get current prices for multiple currencies using batch requests"""
+        prices = {}
+        stablecoins = ['USDT', 'USDC', 'USD', 'BUSD', 'DAI', 'USDP']
 
-    def get_collateral_usd_values(self) -> Dict[str, float]:
-        """Extract USD values for collateral assets from API response"""
-        usd_values = {}
+        # Filter out stablecoins
+        non_stable_currencies = [
+            ccy for ccy in currencies if ccy not in stablecoins]
 
-        collateral_data = self.get_collateral_assets()
+        # Add stablecoins with price 1.0
+        for ccy in stablecoins:
+            if ccy in currencies:
+                prices[ccy] = 1.0
 
-        if collateral_data.get('code') == '0' and collateral_data.get('data'):
-            assets_list = collateral_data['data'][0].get('assets', [])
+        if not non_stable_currencies:
+            return prices
 
-            for asset in assets_list:
-                ccy = asset.get('ccy', '')
-                notional_usd = asset.get('notionalUsd', '0')
+        # Try different quote currencies in order of preference
+        quote_currencies = ['USDT', 'USDC', 'BTC', 'ETH', 'USD']
 
-                if ccy and notional_usd:
-                    try:
-                        usd_values[ccy] = float(notional_usd)
-                    except (ValueError, TypeError):
-                        usd_values[ccy] = 0.0
+        for quote in quote_currencies:
+            # Create instrument IDs for this quote currency
+            inst_ids = [
+                f"{ccy}-{quote}" for ccy in non_stable_currencies if ccy not in prices]
 
-        return usd_values
+            if not inst_ids:
+                break
 
-    def parse_loan_info(self, loan_data: Dict, collateral_usd_values: Dict[str, float] = None) -> Dict:
-        """Parse flexible loan information using direct USD values from API"""
+            # OKX allows multiple instId in one request (up to 20 seems safe)
+            # We'll batch them in groups of 20
+            batch_size = 20
+            for i in range(0, len(inst_ids), batch_size):
+                batch = inst_ids[i:i + batch_size]
+                inst_id_param = ','.join(batch)
+
+                try:
+                    result = self._request(
+                        'GET',
+                        '/api/v5/market/tickers',
+                        {'instType': 'SPOT', 'instId': inst_id_param}
+                    )
+
+                    if result.get('code') == '0' and result.get('data'):
+                        for ticker in result['data']:
+                            inst_id = ticker.get('instId', '')
+                            last_price = ticker.get('last', '0')
+
+                            if inst_id and last_price:
+                                try:
+                                    ccy = inst_id.split('-')[0]
+                                    price_val = float(last_price)
+                                    if price_val > 0 and ccy not in prices:
+                                        prices[ccy] = price_val
+                                        print(
+                                            f"  Found price for {ccy}: ${price_val:.8f} via {quote}")
+                                except (ValueError, IndexError):
+                                    continue
+                except Exception as e:
+                    print(f"  Error fetching batch prices for {quote}: {e}")
+                    continue
+
+        # For any remaining currencies, try individual lookups with multiple quotes
+        remaining_currencies = [
+            ccy for ccy in non_stable_currencies if ccy not in prices]
+
+        for ccy in remaining_currencies:
+            for quote in quote_currencies:
+                if ccy in prices:
+                    break
+
+                inst_id = f"{ccy}-{quote}"
+                try:
+                    result = self._request(
+                        'GET',
+                        '/api/v5/market/ticker',
+                        {'instId': inst_id}
+                    )
+                    if result.get('code') == '0' and result.get('data'):
+                        last_price = result['data'][0].get('last', '0')
+                        if last_price and float(last_price) > 0:
+                            prices[ccy] = float(last_price)
+                            print(
+                                f"  Found price for {ccy}: ${prices[ccy]:.8f} via {quote}")
+                            break
+                except:
+                    continue
+
+            # If still not found, mark as 0
+            if ccy not in prices:
+                prices[ccy] = 0.0
+                print(f"  ❌ No price found for {ccy}")
+
+        return prices
+
+    def calculate_precise_usd_value(self, amount: float, price: float, currency: str) -> float:
+        """Calculate USD value with proper precision handling for low-priced tokens"""
+        try:
+            # Use Decimal for precise calculation with very small numbers
+            amount_dec = Decimal(str(amount))
+            price_dec = Decimal(str(price))
+            usd_value = float(amount_dec * price_dec)
+
+            # For very low-priced tokens, we might need more decimal places
+            if price < 0.0001:  # Very low price tokens like PEPE, SHIB
+                # Round to 8 decimal places for very small values
+                usd_value = round(usd_value, 8)
+            elif price < 0.01:  # Low price tokens
+                usd_value = round(usd_value, 6)
+            else:
+                usd_value = round(usd_value, 2)
+
+            return usd_value
+        except:
+            return 0.0
+
+    def parse_loan_info(self, loan_data: Dict, prices: Dict[str, float] = None) -> Dict:
+        """Parse flexible loan information"""
         loan_metrics = {
             'has_loan': False,
             'collateral_usd': 0.0,
@@ -128,21 +219,29 @@ class OKXLoanMonitor:
         loan_info = data[0]
         loan_metrics['has_loan'] = True
 
-        # Parse collateral with USD values from dedicated endpoint
+        # Parse collateral with USD values
         collateral_data = loan_info.get('collateralData', [])
+        total_calculated_collateral = 0.0
+
         for item in collateral_data:
             amt = float(item.get('amt', 0))
             ccy = item.get('ccy', '')
             if amt > 0:
-                # Use USD value from collateral assets API if available
-                usd_value = collateral_usd_values.get(
-                    ccy, 0.0) if collateral_usd_values else 0.0
+                # Calculate USD value if prices provided
+                usd_value = 0.0
+                if prices and ccy in prices:
+                    usd_value = self.calculate_precise_usd_value(
+                        amt, prices[ccy], ccy)
+                elif ccy in ['USDT', 'USDC', 'USD', 'BUSD', 'DAI', 'USDP']:
+                    usd_value = amt  # Stablecoins are 1:1
 
-                loan_metrics['collateral_assets'].append({
+                collateral_asset = {
                     'currency': ccy,
                     'amount': amt,
                     'usd_value': usd_value
-                })
+                }
+                loan_metrics['collateral_assets'].append(collateral_asset)
+                total_calculated_collateral += usd_value
 
         # Parse loans
         loan_data_list = loan_info.get('loanData', [])
@@ -154,7 +253,7 @@ class OKXLoanMonitor:
                     'amount': amt
                 })
 
-        # Parse metrics - use API values as they're more accurate
+        # Parse metrics from API (these are the authoritative values)
         loan_metrics['collateral_usd'] = float(
             loan_info.get('collateralNotionalUsd', 0))
         loan_metrics['loan_usd'] = float(loan_info.get('loanNotionalUsd', 0))
@@ -164,14 +263,15 @@ class OKXLoanMonitor:
         loan_metrics['liquidation_ltv'] = float(
             loan_info.get('liqLTV', 0)) * 100
 
-        # Calculate total collateral from individual assets for verification
-        calculated_collateral = sum(asset['usd_value']
-                                    for asset in loan_metrics['collateral_assets'])
-
-        # If there's a significant discrepancy, log it (for debugging)
-        if abs(calculated_collateral - loan_metrics['collateral_usd']) > 1.0:
-            print(f"Note: Collateral USD discrepancy - API: ${loan_metrics['collateral_usd']:.2f}, "
-                  f"Calculated: ${calculated_collateral:.2f}")
+        # If our calculated collateral is significantly different from API,
+        # it means our prices might be stale/wrong
+        api_collateral = loan_metrics['collateral_usd']
+        # 10% difference
+        if api_collateral > 0 and abs(total_calculated_collateral - api_collateral) > api_collateral * 0.1:
+            discrepancy_pct = abs(
+                total_calculated_collateral - api_collateral) / api_collateral * 100
+            print(
+                f"⚠️  Price discrepancy: Our calculation ${total_calculated_collateral:.2f} vs API ${api_collateral:.2f} ({discrepancy_pct:.1f}% difference)")
 
         return loan_metrics
 
@@ -294,24 +394,31 @@ class OKXLoanMonitor:
 
             total_shown_usd = 0.0
             shown_count = 0
+            dust_count = 0
+            dust_value = 0.0
 
             for asset in sorted_collateral:
                 usd_val = asset.get('usd_value', 0)
 
-                # Show top assets or assets with significant value
-                if shown_count < 15 and usd_val > 0.01:
+                # Show assets with significant value, group dust
+                if usd_val >= 0.01:  # Show assets worth $0.01 or more
+                    # For very small USD values, show more decimal places
+                    if usd_val < 1.0:
+                        usd_display = f"${usd_val:>14,.4f}"
+                    else:
+                        usd_display = f"${usd_val:>14,.2f}"
+
                     print(
-                        f"  {asset['currency']:<10} {asset['amount']:>20,.8f} ${usd_val:>14,.2f}")
+                        f"  {asset['currency']:<10} {asset['amount']:>20,.8f} {usd_display}")
                     total_shown_usd += usd_val
                     shown_count += 1
-
-            # Count remaining dust
-            dust_count = len(sorted_collateral) - shown_count
-            dust_value = loan_metrics['collateral_usd'] - total_shown_usd
+                else:
+                    dust_count += 1
+                    dust_value += usd_val
 
             if dust_count > 0:
                 print(
-                    f"  ... and {dust_count} more (${dust_value:,.2f} in dust)")
+                    f"  ... and {dust_count} more dust assets (${dust_value:,.4f} total)")
 
             print(f"  {'-'*47}")
             print(
@@ -350,12 +457,26 @@ class OKXLoanMonitor:
         balance = self.get_account_balance()
         loan_info = self.get_flexible_loan_info()
 
-        # Get USD values for collateral assets directly from API
-        print("Fetching collateral USD values...")
-        collateral_usd_values = self.get_collateral_usd_values()
+        # Get list of currencies from loan collateral for price lookup
+        currencies = []
+        if loan_info.get('code') == '0' and loan_info.get('data'):
+            collateral_data = loan_info['data'][0].get('collateralData', [])
+            currencies = [item['ccy'] for item in collateral_data]
+
+        # Fetch prices using efficient batch requests
+        if currencies:
+            print(f"Fetching prices for {len(currencies)} currencies...")
+            prices = self.get_batch_ticker_prices(currencies)
+
+            # Debug: Show PEPE price specifically
+            if 'PEPE' in prices:
+                print(f"  PEPE price: ${prices['PEPE']:.10f}")
+
+        else:
+            prices = {}
 
         account_metrics = self.calculate_account_metrics(balance)
-        loan_metrics = self.parse_loan_info(loan_info, collateral_usd_values)
+        loan_metrics = self.parse_loan_info(loan_info, prices)
 
         self.display_combined_metrics(account_metrics, loan_metrics)
 

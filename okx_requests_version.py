@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 OKX Flexible Multicollateral Loan Monitor
-Clean version with requests library
 """
 
 import os
@@ -15,11 +14,12 @@ from typing import Dict, Optional
 
 
 class OKXLoanMonitor:
-    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0"):
+    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0", debug: bool = False):
         self.api_key = api_key.strip()
         self.secret_key = secret_key.strip()
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
+        self.debug = debug
 
     def _get_timestamp(self) -> str:
         """Get ISO8601 timestamp"""
@@ -80,39 +80,16 @@ class OKXLoanMonitor:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def get_ticker_prices(self, currencies: list) -> Dict[str, float]:
-        """Get current prices for a list of currencies"""
-        prices = {}
+    def get_collateral_assets(self) -> Dict:
+        """Get detailed collateral assets with USD values - NOT USED, returns funding account only"""
+        return self._request('GET', '/api/v5/finance/flexible-loan/collateral-assets')
 
-        # OKX tickers endpoint - we need to query each pair
-        # Most common quote currencies: USDT, USDC, USD
-        for ccy in currencies:
-            if ccy in ['USDT', 'USDC', 'USD']:
-                prices[ccy] = 1.0
-                continue
+    def get_tickers(self, inst_type: str = "SPOT") -> Dict:
+        """Get all tickers at once for price calculation"""
+        return self._request('GET', '/api/v5/market/tickers', {'instType': inst_type})
 
-            # Try multiple quote currencies
-            for quote in ['USDT', 'USDC', 'USD']:
-                inst_id = f"{ccy}-{quote}"
-                try:
-                    result = self._request(
-                        'GET', '/api/v5/market/ticker', {'instId': inst_id})
-                    if result.get('code') == '0' and result.get('data'):
-                        last_price = float(result['data'][0].get('last', 0))
-                        if last_price > 0:
-                            prices[ccy] = last_price
-                            break
-                except:
-                    continue
-
-            # If still not found, mark as 0
-            if ccy not in prices:
-                prices[ccy] = 0.0
-
-        return prices
-
-    def parse_loan_info(self, loan_data: Dict, prices: Dict[str, float] = None) -> Dict:
-        """Parse flexible loan information"""
+    def parse_loan_info(self, loan_data: Dict, tickers_data: Dict = None) -> Dict:
+        """Parse flexible loan information with USD values calculated from tickers"""
         loan_metrics = {
             'has_loan': False,
             'collateral_usd': 0.0,
@@ -134,21 +111,40 @@ class OKXLoanMonitor:
         loan_info = data[0]
         loan_metrics['has_loan'] = True
 
-        # Parse collateral with USD values
-        collateral_data = loan_info.get('collateralData', [])
-        for item in collateral_data:
+        # Build price map from tickers
+        prices = {}
+        if tickers_data and tickers_data.get('code') == '0':
+            tickers = tickers_data.get('data', [])
+            for ticker in tickers:
+                inst_id = ticker.get('instId', '')
+                # Parse pairs like BTC-USDT, ETH-USDC, etc.
+                if '-' in inst_id:
+                    base, quote = inst_id.split('-', 1)
+                    if quote in ['USDT', 'USDC', 'USD']:
+                        last_price = float(ticker.get('last', 0))
+                        if last_price > 0:
+                            # Store the first valid price found for each currency
+                            if base not in prices:
+                                prices[base] = last_price
+
+        # Stablecoins are always $1
+        for stable in ['USDT', 'USDC', 'USD', 'DAI', 'TUSD', 'BUSD']:
+            prices[stable] = 1.0
+
+        # Parse collateral with calculated USD values
+        collateral_list = loan_info.get('collateralData', [])
+        for item in collateral_list:
             amt = float(item.get('amt', 0))
             ccy = item.get('ccy', '')
             if amt > 0:
-                # Calculate USD value if prices provided
-                usd_value = 0.0
-                if prices and ccy in prices:
-                    usd_value = amt * prices[ccy]
+                price = prices.get(ccy, 0.0)
+                usd_value = amt * price if price > 0 else 0.0
 
                 loan_metrics['collateral_assets'].append({
                     'currency': ccy,
                     'amount': amt,
-                    'usd_value': usd_value
+                    'usd_value': usd_value,
+                    'price': price
                 })
 
         # Parse loans
@@ -161,7 +157,7 @@ class OKXLoanMonitor:
                     'amount': amt
                 })
 
-        # Parse metrics
+        # Parse metrics from OKX (already calculated correctly)
         loan_metrics['collateral_usd'] = float(
             loan_info.get('collateralNotionalUsd', 0))
         loan_metrics['loan_usd'] = float(loan_info.get('loanNotionalUsd', 0))
@@ -296,8 +292,9 @@ class OKXLoanMonitor:
             for asset in sorted_collateral:
                 usd_val = asset.get('usd_value', 0)
 
-                # Show top assets or assets with significant value
-                if shown_count < 15 and usd_val > 0.01:
+                # Show assets with USD value > $1
+                if shown_count < 20 and usd_val > 1.0:
+                    price = asset.get('price', 0)
                     print(
                         f"  {asset['currency']:<10} {asset['amount']:>20,.8f} ${usd_val:>14,.2f}")
                     total_shown_usd += usd_val
@@ -347,24 +344,28 @@ class OKXLoanMonitor:
 
         balance = self.get_account_balance()
         loan_info = self.get_flexible_loan_info()
+        tickers = self.get_tickers()  # Get all spot tickers at once
 
-        # Get list of currencies from loan collateral
-        print("Fetching current prices...")
-        currencies = []
-        if loan_info.get('code') == '0' and loan_info.get('data'):
-            collateral_data = loan_info['data'][0].get('collateralData', [])
-            currencies = [item['ccy'] for item in collateral_data]
-
-        # Fetch prices for all collateral currencies
-        prices = self.get_ticker_prices(currencies) if currencies else {}
+        if self.debug:
+            print(f"\n🔍 DEBUG - Got {len(tickers.get('data', []))} tickers")
+            print("\n🔍 DEBUG - Loan Info Collateral Data (first 5):")
+            if loan_info.get('code') == '0' and loan_info.get('data'):
+                collateral = loan_info['data'][0].get('collateralData', [])
+                for i, item in enumerate(collateral[:5]):
+                    print(f"  {i+1}. {item.get('ccy')}: {item.get('amt')}")
+                print(f"  ... total {len(collateral)} collateral assets")
 
         account_metrics = self.calculate_account_metrics(balance)
-        loan_metrics = self.parse_loan_info(loan_info, prices)
+        loan_metrics = self.parse_loan_info(loan_info, tickers)
 
         self.display_combined_metrics(account_metrics, loan_metrics)
 
 
 def main():
+    import sys
+
+    debug = '--debug' in sys.argv or '-d' in sys.argv
+
     api_key = os.getenv('OKX_API_KEY')
     secret_key = os.getenv('OKX_SECRET_KEY')
     passphrase = os.getenv('OKX_PASSPHRASE')
@@ -378,7 +379,7 @@ def main():
         print("  export OKX_PASSPHRASE='...'")
         return
 
-    monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag)
+    monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag, debug)
     monitor.run()
 
 
