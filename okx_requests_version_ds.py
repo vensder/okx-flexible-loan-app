@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OKX Flexible Multicollateral Loan Monitor
-Clean version with requests library
+Improved version with direct USD value from API
 """
 
 import os
@@ -11,7 +11,7 @@ import base64
 import hashlib
 import requests
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 
 class OKXLoanMonitor:
@@ -80,39 +80,33 @@ class OKXLoanMonitor:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def get_ticker_prices(self, currencies: list) -> Dict[str, float]:
-        """Get current prices for a list of currencies"""
-        prices = {}
+    def get_collateral_assets(self) -> Dict:
+        """Get collateral assets with USD values directly from API"""
+        return self._request('GET', '/api/v5/finance/flexible-loan/collateral-assets')
 
-        # OKX tickers endpoint - we need to query each pair
-        # Most common quote currencies: USDT, USDC, USD
-        for ccy in currencies:
-            if ccy in ['USDT', 'USDC', 'USD']:
-                prices[ccy] = 1.0
-                continue
+    def get_collateral_usd_values(self) -> Dict[str, float]:
+        """Extract USD values for collateral assets from API response"""
+        usd_values = {}
 
-            # Try multiple quote currencies
-            for quote in ['USDT', 'USDC', 'USD']:
-                inst_id = f"{ccy}-{quote}"
-                try:
-                    result = self._request(
-                        'GET', '/api/v5/market/ticker', {'instId': inst_id})
-                    if result.get('code') == '0' and result.get('data'):
-                        last_price = float(result['data'][0].get('last', 0))
-                        if last_price > 0:
-                            prices[ccy] = last_price
-                            break
-                except:
-                    continue
+        collateral_data = self.get_collateral_assets()
 
-            # If still not found, mark as 0
-            if ccy not in prices:
-                prices[ccy] = 0.0
+        if collateral_data.get('code') == '0' and collateral_data.get('data'):
+            assets_list = collateral_data['data'][0].get('assets', [])
 
-        return prices
+            for asset in assets_list:
+                ccy = asset.get('ccy', '')
+                notional_usd = asset.get('notionalUsd', '0')
 
-    def parse_loan_info(self, loan_data: Dict, prices: Dict[str, float] = None) -> Dict:
-        """Parse flexible loan information"""
+                if ccy and notional_usd:
+                    try:
+                        usd_values[ccy] = float(notional_usd)
+                    except (ValueError, TypeError):
+                        usd_values[ccy] = 0.0
+
+        return usd_values
+
+    def parse_loan_info(self, loan_data: Dict, collateral_usd_values: Dict[str, float] = None) -> Dict:
+        """Parse flexible loan information using direct USD values from API"""
         loan_metrics = {
             'has_loan': False,
             'collateral_usd': 0.0,
@@ -134,16 +128,15 @@ class OKXLoanMonitor:
         loan_info = data[0]
         loan_metrics['has_loan'] = True
 
-        # Parse collateral with USD values
+        # Parse collateral with USD values from dedicated endpoint
         collateral_data = loan_info.get('collateralData', [])
         for item in collateral_data:
             amt = float(item.get('amt', 0))
             ccy = item.get('ccy', '')
             if amt > 0:
-                # Calculate USD value if prices provided
-                usd_value = 0.0
-                if prices and ccy in prices:
-                    usd_value = amt * prices[ccy]
+                # Use USD value from collateral assets API if available
+                usd_value = collateral_usd_values.get(
+                    ccy, 0.0) if collateral_usd_values else 0.0
 
                 loan_metrics['collateral_assets'].append({
                     'currency': ccy,
@@ -161,7 +154,7 @@ class OKXLoanMonitor:
                     'amount': amt
                 })
 
-        # Parse metrics
+        # Parse metrics - use API values as they're more accurate
         loan_metrics['collateral_usd'] = float(
             loan_info.get('collateralNotionalUsd', 0))
         loan_metrics['loan_usd'] = float(loan_info.get('loanNotionalUsd', 0))
@@ -170,6 +163,15 @@ class OKXLoanMonitor:
             loan_info.get('marginCallLTV', 0)) * 100
         loan_metrics['liquidation_ltv'] = float(
             loan_info.get('liqLTV', 0)) * 100
+
+        # Calculate total collateral from individual assets for verification
+        calculated_collateral = sum(asset['usd_value']
+                                    for asset in loan_metrics['collateral_assets'])
+
+        # If there's a significant discrepancy, log it (for debugging)
+        if abs(calculated_collateral - loan_metrics['collateral_usd']) > 1.0:
+            print(f"Note: Collateral USD discrepancy - API: ${loan_metrics['collateral_usd']:.2f}, "
+                  f"Calculated: ${calculated_collateral:.2f}")
 
         return loan_metrics
 
@@ -348,18 +350,12 @@ class OKXLoanMonitor:
         balance = self.get_account_balance()
         loan_info = self.get_flexible_loan_info()
 
-        # Get list of currencies from loan collateral
-        print("Fetching current prices...")
-        currencies = []
-        if loan_info.get('code') == '0' and loan_info.get('data'):
-            collateral_data = loan_info['data'][0].get('collateralData', [])
-            currencies = [item['ccy'] for item in collateral_data]
-
-        # Fetch prices for all collateral currencies
-        prices = self.get_ticker_prices(currencies) if currencies else {}
+        # Get USD values for collateral assets directly from API
+        print("Fetching collateral USD values...")
+        collateral_usd_values = self.get_collateral_usd_values()
 
         account_metrics = self.calculate_account_metrics(balance)
-        loan_metrics = self.parse_loan_info(loan_info, prices)
+        loan_metrics = self.parse_loan_info(loan_info, collateral_usd_values)
 
         self.display_combined_metrics(account_metrics, loan_metrics)
 
