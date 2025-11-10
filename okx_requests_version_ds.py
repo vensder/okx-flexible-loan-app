@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OKX Flexible Multicollateral Loan Monitor
-Fixed version with USD-only price fetching
+Optimized version with batch requests and caching
 """
 
 import os
@@ -10,9 +10,11 @@ import hmac
 import base64
 import hashlib
 import requests
+import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
-from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Optional, List, Set
+from decimal import Decimal
+from functools import lru_cache
 
 
 class OKXLoanMonitor:
@@ -21,6 +23,9 @@ class OKXLoanMonitor:
         self.secret_key = secret_key.strip()
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
+        self.price_cache = {}
+        self.cache_timestamp = 0
+        self.CACHE_DURATION = 30  # Cache prices for 30 seconds
 
     def _get_timestamp(self) -> str:
         """Get ISO8601 timestamp"""
@@ -68,6 +73,8 @@ class OKXLoanMonitor:
                 response = requests.post(
                     url, headers=headers, data=body, timeout=10)
 
+            # Respect rate limits - add small delay
+            time.sleep(0.1)
             return response.json()
 
         except requests.exceptions.RequestException as e:
@@ -81,79 +88,132 @@ class OKXLoanMonitor:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
 
-    def get_usd_ticker_prices(self, currencies: list) -> Dict[str, float]:
-        """Get current USD prices for multiple currencies"""
+    def get_all_usd_pairs(self) -> Dict[str, float]:
+        """Get all USD-based trading pairs in one batch request"""
+        current_time = time.time()
+
+        # Use cached prices if they're still fresh
+        if self.price_cache and (current_time - self.cache_timestamp) < self.CACHE_DURATION:
+            print("  Using cached prices...")
+            return self.price_cache.copy()
+
+        print("  Fetching all USD pairs (this may take a few seconds)...")
         prices = {}
+        usd_quotes = ['USDT', 'USDC', 'USD']
         stablecoins = ['USDT', 'USDC', 'USD', 'BUSD', 'DAI', 'USDP']
 
-        # Filter out stablecoins
-        non_stable_currencies = [
-            ccy for ccy in currencies if ccy not in stablecoins]
+        # Add stablecoins
+        for stablecoin in stablecoins:
+            prices[stablecoin] = 1.0
 
-        # Add stablecoins with price 1.0
-        for ccy in stablecoins:
-            if ccy in currencies:
-                prices[ccy] = 1.0
+        # Fetch all spot tickers in batches
+        page = 1
+        max_pages = 5  # Limit pages to avoid too many requests
 
-        if not non_stable_currencies:
-            return prices
+        while page <= max_pages:
+            try:
+                result = self._request(
+                    'GET',
+                    '/api/v5/market/tickers',
+                    {'instType': 'SPOT', 'limit': '100', 'page': str(page)}
+                )
 
-        # Only use USD-based pairs to avoid currency conversion issues
-        usd_quote_currencies = ['USDT', 'USDC', 'USD']
+                if result.get('code') == '0' and result.get('data'):
+                    tickers = result['data']
+                    if not tickers:
+                        break
 
-        print("  Fetching USD-based prices only...")
+                    for ticker in tickers:
+                        inst_id = ticker.get('instId', '')
+                        last_price = ticker.get('last', '0')
 
-        for ccy in non_stable_currencies:
-            if ccy in prices:
-                continue
+                        if inst_id and last_price:
+                            # Check if it's a USD-based pair
+                            for quote in usd_quotes:
+                                if inst_id.endswith(f"-{quote}"):
+                                    # Remove "-QUOTE" suffix
+                                    base_ccy = inst_id[:-len(quote)-1]
+                                    try:
+                                        price_val = float(last_price)
+                                        if price_val > 0:
+                                            # Only add if not already present or if this is a better quote
+                                            if base_ccy not in prices or quote == 'USDT':  # Prefer USDT
+                                                prices[base_ccy] = price_val
+                                    except (ValueError, TypeError):
+                                        continue
+                                    break
 
-            price_found = False
-            for quote in usd_quote_currencies:
-                inst_id = f"{ccy}-{quote}"
-                try:
-                    result = self._request(
-                        'GET',
-                        '/api/v5/market/ticker',
-                        {'instId': inst_id}
-                    )
-                    if result.get('code') == '0' and result.get('data'):
-                        last_price = result['data'][0].get('last', '0')
-                        if last_price and float(last_price) > 0:
-                            price_val = float(last_price)
-                            prices[ccy] = price_val
-                            print(f"    {ccy}: ${price_val:.8f} via {quote}")
-                            price_found = True
-                            break
-                except Exception as e:
+                    page += 1
+                    # Small delay between pages to be respectful of rate limits
+                    time.sleep(0.2)
+                else:
+                    break
+
+            except Exception as e:
+                print(f"  Error fetching page {page}: {e}")
+                break
+
+        print(f"  Found {len(prices)} USD-based trading pairs")
+
+        # Cache the results
+        self.price_cache = prices.copy()
+        self.cache_timestamp = current_time
+
+        return prices
+
+    def get_usd_ticker_prices(self, currencies: list) -> Dict[str, float]:
+        """Get current USD prices for multiple currencies using cached batch data"""
+        prices = {}
+
+        # Get all USD pairs from cache or batch request
+        all_usd_pairs = self.get_all_usd_pairs()
+
+        # Match requested currencies with available pairs
+        missing_currencies = []
+
+        for ccy in currencies:
+            if ccy in all_usd_pairs:
+                prices[ccy] = all_usd_pairs[ccy]
+            else:
+                missing_currencies.append(ccy)
+
+        # Try to find missing currencies with individual lookups
+        if missing_currencies:
+            print(
+                f"  Looking for {len(missing_currencies)} missing currencies...")
+            usd_quotes = ['USDT', 'USDC', 'USD']
+
+            for ccy in missing_currencies:
+                if ccy in prices:
                     continue
 
-            if not price_found:
-                # Try to find any USD pair using the tickers endpoint
-                try:
-                    result = self._request(
-                        'GET',
-                        '/api/v5/market/tickers',
-                        {'instType': 'SPOT'}
-                    )
-                    if result.get('code') == '0' and result.get('data'):
-                        for ticker in result['data']:
-                            inst_id = ticker.get('instId', '')
-                            if inst_id.startswith(f"{ccy}-") and any(quote in inst_id for quote in usd_quote_currencies):
-                                last_price = ticker.get('last', '0')
-                                if last_price and float(last_price) > 0:
-                                    price_val = float(last_price)
-                                    prices[ccy] = price_val
-                                    quote_used = inst_id.split('-')[1]
-                                    print(
-                                        f"    {ccy}: ${price_val:.8f} via {quote_used} (from tickers)")
-                                    price_found = True
-                                    break
-                except:
-                    pass
+                price_found = False
+                for quote in usd_quotes:
+                    inst_id = f"{ccy}-{quote}"
+                    try:
+                        result = self._request(
+                            'GET',
+                            '/api/v5/market/ticker',
+                            {'instId': inst_id}
+                        )
+                        if result.get('code') == '0' and result.get('data'):
+                            last_price = result['data'][0].get('last', '0')
+                            if last_price and float(last_price) > 0:
+                                price_val = float(last_price)
+                                prices[ccy] = price_val
+                                print(
+                                    f"    Found {ccy}: ${price_val:.8f} via {quote}")
+                                price_found = True
 
-            if not price_found:
-                prices[ccy] = 0.0
-                print(f"    ❌ No USD price found for {ccy}")
+                                # Add to cache for future use
+                                self.price_cache[ccy] = price_val
+                                break
+                    except Exception:
+                        continue
+
+                if not price_found:
+                    prices[ccy] = 0.0
+                    print(f"    ❌ No USD price found for {ccy}")
 
         return prices
 
@@ -445,7 +505,7 @@ class OKXLoanMonitor:
             collateral_data = loan_info['data'][0].get('collateralData', [])
             currencies = [item['ccy'] for item in collateral_data]
 
-        # Fetch prices using USD-only pairs
+        # Fetch prices using optimized batch approach
         if currencies:
             print(f"Fetching USD prices for {len(currencies)} currencies...")
             prices = self.get_usd_ticker_prices(currencies)
@@ -453,14 +513,6 @@ class OKXLoanMonitor:
             # Debug: Show PEPE price specifically
             if 'PEPE' in prices:
                 print(f"  PEPE/USD price: ${prices['PEPE']:.10f}")
-                # Calculate what PEPE should be worth
-                pepe_amount = next(
-                    (item['amt'] for item in collateral_data if item['ccy'] == 'PEPE'), 0)
-                if pepe_amount:
-                    calculated_value = float(
-                        Decimal(str(pepe_amount)) * Decimal(str(prices['PEPE'])))
-                    print(
-                        f"  PEPE calculation: {pepe_amount} × ${prices['PEPE']:.10f} = ${calculated_value:.2f}")
 
         else:
             prices = {}
