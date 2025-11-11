@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OKX Flexible Multicollateral Loan Monitor
-Optimized version with batch requests and caching
+Optimized version with SQLite caching between runs
 """
 
 import os
@@ -11,10 +11,88 @@ import base64
 import hashlib
 import requests
 import time
+import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Set
+from typing import Dict, Optional, List
 from decimal import Decimal
-from functools import lru_cache
+import atexit
+
+
+class PriceCache:
+    def __init__(self, db_path: str = "okx_cache.db"):
+        self.db_path = db_path
+        self._init_db()
+        atexit.register(self.cleanup_old_entries)
+
+    def _init_db(self):
+        """Initialize SQLite database"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS price_cache (
+                    currency TEXT PRIMARY KEY,
+                    price REAL NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                )
+            ''')
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_expires_at ON price_cache(expires_at)')
+            conn.commit()
+
+    def get(self, currency: str) -> Optional[float]:
+        """Get price from cache if not expired"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                'SELECT price FROM price_cache WHERE currency = ? AND expires_at > ?',
+                (currency, int(time.time()))
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+
+    def set(self, currency: str, price: float, ttl: int = 300):
+        """Set price in cache with TTL (default 5 minutes)"""
+        timestamp = int(time.time())
+        expires_at = timestamp + ttl
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                '''INSERT OR REPLACE INTO price_cache
+                   (currency, price, timestamp, expires_at)
+                   VALUES (?, ?, ?, ?)''',
+                (currency, price, timestamp, expires_at)
+            )
+            conn.commit()
+
+    def set_batch(self, prices: Dict[str, float], ttl: int = 300):
+        """Set multiple prices at once"""
+        timestamp = int(time.time())
+        expires_at = timestamp + ttl
+
+        with sqlite3.connect(self.db_path) as conn:
+            for currency, price in prices.items():
+                conn.execute(
+                    '''INSERT OR REPLACE INTO price_cache
+                       (currency, price, timestamp, expires_at)
+                       VALUES (?, ?, ?, ?)''',
+                    (currency, price, timestamp, expires_at)
+                )
+            conn.commit()
+
+    def cleanup_old_entries(self):
+        """Remove expired cache entries"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'DELETE FROM price_cache WHERE expires_at <= ?', (int(time.time()),))
+            conn.commit()
+
+    def get_stats(self) -> Dict:
+        """Get cache statistics"""
+        with sqlite3.connect(self.db_path) as conn:
+            total = conn.execute(
+                'SELECT COUNT(*) FROM price_cache').fetchone()[0]
+            valid = conn.execute('SELECT COUNT(*) FROM price_cache WHERE expires_at > ?',
+                                 (int(time.time()),)).fetchone()[0]
+            return {'total_entries': total, 'valid_entries': valid}
 
 
 class OKXLoanMonitor:
@@ -23,6 +101,9 @@ class OKXLoanMonitor:
         self.secret_key = secret_key.strip()
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
+        self.cache = PriceCache()
+
+        # In-memory cache for current session
         self.price_cache = {}
         self.cache_timestamp = 0
         self.CACHE_DURATION = 30  # Cache prices for 30 seconds
@@ -94,7 +175,7 @@ class OKXLoanMonitor:
 
         # Use cached prices if they're still fresh
         if self.price_cache and (current_time - self.cache_timestamp) < self.CACHE_DURATION:
-            print("  Using cached prices...")
+            print("  Using session-cached prices...")
             return self.price_cache.copy()
 
         print("  Fetching all USD pairs (this may take a few seconds)...")
@@ -155,65 +236,97 @@ class OKXLoanMonitor:
 
         print(f"  Found {len(prices)} USD-based trading pairs")
 
-        # Cache the results
+        # Cache the results in SQLite for future runs (5 minute TTL)
+        self.cache.set_batch(prices, ttl=300)
+
+        # Also cache in memory for current session
         self.price_cache = prices.copy()
         self.cache_timestamp = current_time
 
         return prices
 
     def get_usd_ticker_prices(self, currencies: list) -> Dict[str, float]:
-        """Get current USD prices for multiple currencies using cached batch data"""
+        """Get current USD prices for multiple currencies using cached data"""
         prices = {}
+        cache_stats = self.cache.get_stats()
+        print(
+            f"  Cache stats: {cache_stats['valid_entries']}/{cache_stats['total_entries']} valid entries")
 
-        # Get all USD pairs from cache or batch request
-        all_usd_pairs = self.get_all_usd_pairs()
-
-        # Match requested currencies with available pairs
+        # First try to get prices from SQLite cache
+        cached_currencies = []
         missing_currencies = []
 
         for ccy in currencies:
-            if ccy in all_usd_pairs:
-                prices[ccy] = all_usd_pairs[ccy]
+            cached_price = self.cache.get(ccy)
+            if cached_price is not None:
+                prices[ccy] = cached_price
+                cached_currencies.append(ccy)
             else:
                 missing_currencies.append(ccy)
 
-        # Try to find missing currencies with individual lookups
+        if cached_currencies:
+            print(f"  Found {len(cached_currencies)} currencies in cache")
+
+        # If we have missing currencies, try batch API
         if missing_currencies:
             print(
-                f"  Looking for {len(missing_currencies)} missing currencies...")
-            usd_quotes = ['USDT', 'USDC', 'USD']
+                f"  Fetching {len(missing_currencies)} missing currencies from API...")
+            all_usd_pairs = self.get_all_usd_pairs()
+
+            # Match missing currencies with batch data
+            newly_found = []
+            still_missing = []
 
             for ccy in missing_currencies:
-                if ccy in prices:
-                    continue
+                if ccy in all_usd_pairs:
+                    prices[ccy] = all_usd_pairs[ccy]
+                    newly_found.append(ccy)
+                else:
+                    still_missing.append(ccy)
 
-                price_found = False
-                for quote in usd_quotes:
-                    inst_id = f"{ccy}-{quote}"
-                    try:
-                        result = self._request(
-                            'GET',
-                            '/api/v5/market/ticker',
-                            {'instId': inst_id}
-                        )
-                        if result.get('code') == '0' and result.get('data'):
-                            last_price = result['data'][0].get('last', '0')
-                            if last_price and float(last_price) > 0:
-                                price_val = float(last_price)
-                                prices[ccy] = price_val
-                                print(
-                                    f"    Found {ccy}: ${price_val:.8f} via {quote}")
-                                price_found = True
+            if newly_found:
+                print(f"    Found {len(newly_found)} currencies in batch API")
+                # Cache the newly found prices
+                new_prices = {ccy: prices[ccy] for ccy in newly_found}
+                self.cache.set_batch(new_prices, ttl=300)
 
-                                # Add to cache for future use
-                                self.price_cache[ccy] = price_val
-                                break
-                    except Exception:
+            # Try individual lookups for any remaining missing currencies
+            if still_missing:
+                print(
+                    f"    Looking for {len(still_missing)} currencies individually...")
+                usd_quotes = ['USDT', 'USDC', 'USD']
+
+                for ccy in still_missing:
+                    if ccy in prices:
                         continue
 
-                if not price_found:
-                    prices[ccy] = 0.0
-                    print(f"    ❌ No USD price found for {ccy}")
+                    price_found = False
+                    for quote in usd_quotes:
+                        inst_id = f"{ccy}-{quote}"
+                        try:
+                            result = self._request(
+                                'GET',
+                                '/api/v5/market/ticker',
+                                {'instId': inst_id}
+                            )
+                            if result.get('code') == '0' and result.get('data'):
+                                last_price = result['data'][0].get('last', '0')
+                                if last_price and float(last_price) > 0:
+                                    price_val = float(last_price)
+                                    prices[ccy] = price_val
+                                    print(
+                                        f"      Found {ccy}: ${price_val:.8f} via {quote}")
+                                    price_found = True
+
+                                    # Add to cache
+                                    self.cache.set(ccy, price_val, ttl=300)
+                                    break
+                        except Exception:
+                            continue
+
+                    if not price_found:
+                        prices[ccy] = 0.0
+                        print(f"      ❌ No USD price found for {ccy}")
 
         return prices
 
@@ -505,7 +618,7 @@ class OKXLoanMonitor:
             collateral_data = loan_info['data'][0].get('collateralData', [])
             currencies = [item['ccy'] for item in collateral_data]
 
-        # Fetch prices using optimized batch approach
+        # Fetch prices using optimized caching approach
         if currencies:
             print(f"Fetching USD prices for {len(currencies)} currencies...")
             prices = self.get_usd_ticker_prices(currencies)
