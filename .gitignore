@@ -51,3 +51,7 @@ keys/
 config/secrets.json
 keys/*.pem
 *.key
+
+# SQLite db
+*.db
+**/*.db
