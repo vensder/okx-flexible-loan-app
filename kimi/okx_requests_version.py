@@ -9,12 +9,68 @@ import hmac
 import base64
 import hashlib
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
 from decimal import Decimal, ROUND_DOWN
 import concurrent.futures
 import time
 from functools import lru_cache
+import sqlite3
+
+
+class OKXDataCache:
+    def __init__(self, db_path: str = "okx_cache.db"):
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        """Initialize SQLite database with cache table"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expires_at DATETIME
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_expires ON cache(expires_at)
+            """)
+
+    def get(self, key: str, max_age_seconds: int = 300) -> Optional[Dict]:
+        """Get cached data if not expired"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT data, timestamp FROM cache
+                WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)
+            """, (key, datetime.now()))
+
+            result = cursor.fetchone()
+            if result:
+                data, timestamp = result
+                # Check age
+                cache_time = datetime.fromisoformat(timestamp)
+                if (datetime.now() - cache_time).total_seconds() < max_age_seconds:
+                    return json.loads(data)
+
+            return None
+
+    def set(self, key: str, data: Dict, expire_seconds: int = 300):
+        """Cache data with expiration"""
+        expires_at = datetime.now() + timedelta(seconds=expire_seconds)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO cache (key, data, expires_at)
+                VALUES (?, ?, ?)
+            """, (key, json.dumps(data), expires_at))
+
+    def cleanup_expired(self):
+        """Remove expired entries"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM cache WHERE expires_at < ?",
+                         (datetime.now(),))
+            conn.commit()
 
 
 class OKXLoanMonitor:
@@ -24,6 +80,7 @@ class OKXLoanMonitor:
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
         self.session = requests.Session()  # Use session for connection pooling
+        self.cache = OKXDataCache()  # Add cache instance
 
     def _get_timestamp(self) -> str:
         """Get ISO8601 timestamp"""
@@ -80,9 +137,39 @@ class OKXLoanMonitor:
         """Get trading account balance"""
         return self._request('GET', '/api/v5/account/balance')
 
+    def get_account_balance_cached(self) -> Dict:
+        """Get trading account balance with caching"""
+        cache_key = "account_balance"
+        cached_data = self.cache.get(
+            cache_key, max_age_seconds=60)  # 1 minute cache
+
+        if cached_data:
+            print("📋 Using cached account balance")
+            return cached_data
+
+        # Fetch fresh data
+        data = self._request('GET', '/api/v5/account/balance')
+        self.cache.set(cache_key, data, expire_seconds=60)
+        return data
+
     def get_flexible_loan_info(self) -> Dict:
         """Get flexible loan information"""
         return self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
+
+    def get_flexible_loan_info_cached(self) -> Dict:
+        """Get flexible loan information with caching"""
+        cache_key = "flexible_loan_info"
+        cached_data = self.cache.get(
+            cache_key, max_age_seconds=30)  # 30 second cache
+
+        if cached_data:
+            print("📋 Using cached loan info")
+            return cached_data
+
+        # Fetch fresh data
+        data = self._request('GET', '/api/v5/finance/flexible-loan/loan-info')
+        self.cache.set(cache_key, data, expire_seconds=30)
+        return data
 
     @lru_cache(maxsize=1)
     def get_all_tickers(self) -> Dict[str, float]:
@@ -141,6 +228,21 @@ class OKXLoanMonitor:
                 prices[ccy] = 0.0
                 print(f"    ❌ No USD price found for {ccy}")
 
+        return prices
+
+    def get_usd_ticker_prices_cached(self, currencies: list) -> Dict[str, float]:
+        """Get prices with caching"""
+        cache_key = f"prices_{','.join(sorted(currencies))}"
+        cached_data = self.cache.get(
+            cache_key, max_age_seconds=10)  # 10 second cache
+
+        if cached_data:
+            print("📋 Using cached prices")
+            return cached_data
+
+        # Fetch fresh data
+        prices = self.get_usd_ticker_prices_optimized(currencies)
+        self.cache.set(cache_key, prices, expire_seconds=10)
         return prices
 
     def fetch_all_data_parallel(self) -> tuple:
@@ -443,6 +545,37 @@ class OKXLoanMonitor:
         print(
             f"⏱️  Total execution time: {time.time() - start_time:.2f} seconds")
 
+    def run_cached(self):
+        """Main execution method with caching"""
+        start_time = time.time()
+
+        # Use cached methods
+        balance = self.get_account_balance_cached()
+        loan_info = self.get_flexible_loan_info_cached()
+
+        # Get currencies and prices
+        currencies = []
+        if loan_info.get('code') == '0' and loan_info.get('data'):
+            collateral_data = loan_info['data'][0].get('collateralData', [])
+            currencies = [item['ccy'] for item in collateral_data]
+
+        if currencies:
+            print(f"Fetching USD prices for {len(currencies)} currencies...")
+            prices = self.get_usd_ticker_prices_cached(currencies)
+        else:
+            prices = {}
+
+        # Process and display
+        account_metrics = self.calculate_account_metrics(balance)
+        loan_metrics = self.parse_loan_info(loan_info, prices)
+        self.display_combined_metrics(account_metrics, loan_metrics)
+
+        print(
+            f"⏱️  Total execution time: {time.time() - start_time:.2f} seconds")
+
+        # Cleanup old cache entries
+        self.cache.cleanup_expired()
+
 
 def main():
     api_key = os.getenv('OKX_API_KEY')
@@ -458,8 +591,10 @@ def main():
         print("  export OKX_PASSPHRASE='...'")
         return
 
+    # monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag)
     monitor = OKXLoanMonitor(api_key, secret_key, passphrase, flag)
-    monitor.run()
+    # monitor.run
+    monitor.run_cached()
 
 
 if __name__ == "__main__":
