@@ -9,17 +9,181 @@ import hmac
 import base64
 import hashlib
 import requests
+import sqlite3
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
 
 class OKXLoanMonitor:
-    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0", debug: bool = False):
+    def __init__(self, api_key: str, secret_key: str, passphrase: str, flag: str = "0", debug: bool = False, db_path: str = "okx_loan_history.db"):
         self.api_key = api_key.strip()
         self.secret_key = secret_key.strip()
         self.passphrase = passphrase.strip()
         self.base_url = "https://www.okx.com"
         self.debug = debug
+        self.db_path = db_path
+        self._init_database()
+
+    def _init_database(self):
+        """Initialize SQLite database with schema"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Main snapshots table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS loan_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                collateral_usd REAL,
+                loan_usd REAL,
+                current_ltv REAL,
+                margin_call_ltv REAL,
+                liquidation_ltv REAL,
+                ltv_to_margin_call REAL,
+                ltv_to_liquidation REAL,
+                risk_level TEXT,
+                account_balance_usd REAL
+            )
+        ''')
+
+        # Collateral details table (optional - stores individual assets)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS collateral_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER,
+                currency TEXT,
+                amount REAL,
+                usd_value REAL,
+                price REAL,
+                FOREIGN KEY (snapshot_id) REFERENCES loan_snapshots(id)
+            )
+        ''')
+
+        # Create indexes for faster queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_timestamp
+            ON loan_snapshots(timestamp)
+        ''')
+
+        conn.commit()
+        conn.close()
+
+    def save_snapshot(self, account_metrics: Dict, loan_metrics: Dict):
+        """Save current snapshot to database"""
+        if not loan_metrics.get('has_loan'):
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Calculate risk level
+        current_ltv = loan_metrics['current_ltv']
+        margin_call_ltv = loan_metrics['margin_call_ltv']
+        margin_call_pct = (current_ltv / margin_call_ltv) * \
+            100 if margin_call_ltv > 0 else 0
+
+        if margin_call_pct < 70:
+            risk_level = "SAFE"
+        elif margin_call_pct < 85:
+            risk_level = "CAUTION"
+        elif margin_call_pct < 95:
+            risk_level = "WARNING"
+        elif current_ltv < margin_call_ltv:
+            risk_level = "HIGH_RISK"
+        else:
+            risk_level = "MARGIN_CALL"
+
+        # Insert main snapshot
+        cursor.execute('''
+            INSERT INTO loan_snapshots (
+                collateral_usd, loan_usd, current_ltv, margin_call_ltv,
+                liquidation_ltv, ltv_to_margin_call, ltv_to_liquidation,
+                risk_level, account_balance_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            loan_metrics['collateral_usd'],
+            loan_metrics['loan_usd'],
+            loan_metrics['current_ltv'],
+            loan_metrics['margin_call_ltv'],
+            loan_metrics['liquidation_ltv'],
+            margin_call_ltv - current_ltv,
+            loan_metrics['liquidation_ltv'] - current_ltv,
+            risk_level,
+            account_metrics.get('total_equity_usd', 0)
+        ))
+
+        snapshot_id = cursor.lastrowid
+
+        # Optionally save top collateral details (top 20 by value to keep DB small)
+        sorted_collateral = sorted(
+            loan_metrics['collateral_assets'],
+            key=lambda x: x.get('usd_value', 0),
+            reverse=True
+        )
+
+        for asset in sorted_collateral[:20]:
+            if asset.get('usd_value', 0) > 1.0:  # Only save meaningful amounts
+                cursor.execute('''
+                    INSERT INTO collateral_details (
+                        snapshot_id, currency, amount, usd_value, price
+                    ) VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    snapshot_id,
+                    asset['currency'],
+                    asset['amount'],
+                    asset.get('usd_value', 0),
+                    asset.get('price', 0)
+                ))
+
+        conn.commit()
+        conn.close()
+
+        if self.debug:
+            print(f"\n💾 Saved snapshot #{snapshot_id} to database")
+
+    def get_history(self, hours: int = 24) -> list:
+        """Get historical snapshots from the last N hours"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT
+                timestamp, current_ltv, collateral_usd, loan_usd,
+                risk_level, ltv_to_margin_call
+            FROM loan_snapshots
+            WHERE timestamp >= datetime('now', '-' || ? || ' hours')
+            ORDER BY timestamp DESC
+        ''', (hours,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        return rows
+
+    def print_history_summary(self, hours: int = 24):
+        """Print a summary of recent history"""
+        history = self.get_history(hours)
+
+        if not history:
+            print(f"\n📊 No historical data from the last {hours} hours")
+            return
+
+        print(f"\n📊 HISTORY (Last {hours} hours - {len(history)} snapshots)")
+        print(
+            f"  {'Time':<20} {'LTV':<8} {'Collateral':<12} {'Risk':<12} {'Buffer':<10}")
+        print(f"  {'-'*20} {'-'*8} {'-'*12} {'-'*12} {'-'*10}")
+
+        for row in history[:10]:  # Show last 10
+            timestamp, ltv, collateral, loan, risk, buffer = row
+            # Parse timestamp and format
+            dt = datetime.fromisoformat(timestamp)
+            time_str = dt.strftime('%m-%d %H:%M')
+
+            print(
+                f"  {time_str:<20} {ltv:>6.2f}% ${collateral:>10,.0f} {risk:<12} {buffer:>8.2f}%")
+
+        if len(history) > 10:
+            print(f"  ... and {len(history) - 10} more snapshots")
 
     def _get_timestamp(self) -> str:
         """Get ISO8601 timestamp"""
@@ -358,7 +522,14 @@ class OKXLoanMonitor:
         account_metrics = self.calculate_account_metrics(balance)
         loan_metrics = self.parse_loan_info(loan_info, tickers)
 
+        # Save to database
+        self.save_snapshot(account_metrics, loan_metrics)
+
+        # Display current status
         self.display_combined_metrics(account_metrics, loan_metrics)
+
+        # Show recent history
+        self.print_history_summary(hours=24)
 
 
 def main():
