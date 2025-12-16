@@ -10,7 +10,7 @@ cryptography==46.0.3
 detect-secrets==1.5.0
 distlib==0.4.0
 docstring-to-markdown==0.17
-filelock==3.18.0
+filelock==3.20.1
 identify==2.6.15
 idna==3.11
 importlib_metadata==8.7.0
